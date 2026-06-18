@@ -1,3 +1,4 @@
 docs/scratch.txt
 .env
 test-notebooks/.env
+.DS_Store
