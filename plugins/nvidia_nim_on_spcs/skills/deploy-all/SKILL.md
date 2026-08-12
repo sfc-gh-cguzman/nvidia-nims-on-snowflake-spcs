@@ -56,19 +56,22 @@ Pools are created but no service runs on them yet, so nothing is billing.
 
 ## Phase 2: NGC key — free
 
-`/nvidia-nim-on-spcs:setup` Step 5. Three sub-steps, in this order:
+`/nvidia-nim-on-spcs:setup` Step 5, now a single command that the **user** runs, not the
+assistant:
 
-1. Prompt with `read -rsp` into `NGC_API_KEY`. Never echo it, never put it on a command
-   line, never write it into `config.json`.
-2. **Preflight it before creating anything:**
-   ```bash
-   python3 "$PLUGIN_DIR/assets/preflight/check_ngc_key.py" --config "$CONFIG"
-   ```
-   Validates the key (401 if bad), entitlement to every enabled NIM (403 if not
-   entitled), and that each configured tag exists. **Stop on failure** — an unentitled
-   key otherwise fails in Phase 3 with a bare `403 Forbidden` after a compute pool has
-   started.
-3. Create the secret through a `umask 077` temp file, shred it, unset the variable.
+```
+! python3 "$PLUGIN_DIR/assets/preflight/provision_ngc_secret.py" --connection "$CONN"
+```
+
+It prompts twice with echo off, preflights the key against the live registry, and only
+then creates the Snowflake secret. **Stop on failure** — an unentitled key otherwise
+fails in Phase 3 with a bare `403 Forbidden` after a compute pool has started.
+
+Never route the key through the assistant: chat content is persisted to conversation
+history in plaintext, and argv is readable by any local process via `ps`. The script
+refuses to run non-interactively for this reason, so it cannot be driven by a tool.
+
+Add `--replace` only when rotating; without it an existing secret is left untouched.
 
 ## Phase 3: Mirror the images — COSTS MONEY
 

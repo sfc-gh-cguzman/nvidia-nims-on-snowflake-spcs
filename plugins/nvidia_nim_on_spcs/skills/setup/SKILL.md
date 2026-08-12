@@ -147,23 +147,72 @@ Do not create the secret from an unvalidated key. A bad or unentitled key does n
 here, it fails much later in the build phase with a bare `403 Forbidden` after a compute
 pool has already started.
 
-### 5a. Prompt for the key
+### 5a. One command: prompt, validate, create
 
-Read it into the environment without echoing it, and without putting it on a command
-line (argv is visible to other processes via `ps`):
+**You run this, not the assistant.** Use the `!` prefix so it executes in the user's own
+terminal session with a real TTY:
 
-```bash
-read -rsp 'NGC API key (nvapi-...): ' NGC_API_KEY; echo
-export NGC_API_KEY
+```
+! python3 "$PLUGIN_DIR/assets/preflight/provision_ngc_secret.py" --connection "$CONN"
 ```
 
-### 5b. Preflight it against the registry
+Add `--config <path>` if config.json is not at the plugin root, and `--replace` to
+rotate an existing secret (without it, an existing secret is left untouched and the
+script exits 1, so a re-run is never destructive).
 
-```bash
-python3 "$PLUGIN_DIR/assets/preflight/check_ngc_key.py" --config "$CONFIG"
+It does three things in order and stops at the first failure:
+
+1. **Prompts twice** for the key with echo off, and requires the two entries to match.
+2. **Preflights** it against the live registry - key validity, per-NIM entitlement, and
+   tag existence (the table in 5b below).
+3. **Creates the secret** only if every check passed.
+
+Expected output, all of which is safe to show anyone:
+
+```
+[PASS] key            valid, NGC user 'someone'
+[PASS] genmol         entitled to nim/nvidia/genmol, tag '2.0' exists
+[OK]   created NIMS_DB.NV.NGC_API_KEY
+       name=NGC_API_KEY  type=GENERIC_STRING  created=...
 ```
 
-Three checks, all against the live registry:
+#### Why it is built this way
+
+**Never route a secret through the assistant.** Not via a question, not pasted into
+chat, not on a command line. Anything in a conversation is written to
+`~/.snowflake/cortex/conversations/<id>.json` in plaintext and kept; argv is readable by
+any local process via `ps`. The assistant orchestrates around this command and never
+sees the value.
+
+**Why the script prompts twice.** `sys.stdin.isatty()` returns True inside an agent's
+pseudo-terminal, and there getpass does not block - it returns stale bytes from the pty
+buffer. Measured: a getpass call in an agent shell captured 13 characters with no human
+involved. Double entry is the interlock, because buffered junk does not repeat and a
+human typing the key twice does. Verified: run through a tool, the script refuses.
+
+**Why not a shell `read`.** The hidden-read flag is not portable. `read -rsp 'p' VAR` is
+bash; under zsh `-p` means *read from coprocess*, so that line fails with
+`read: -p: no coprocess` and leaves the variable **empty** - which creates an empty
+secret that surfaces much later as an opaque auth error. The zsh form is
+`read -rs "?prompt"` into `$REPLY`. Python's getpass behaves the same on both, so the
+script uses it and the question disappears.
+
+**Why a SQL literal is acceptable here.** `CREATE SECRET` takes no bind parameters, so
+the value must be inlined. Verified safe: Snowflake redacts `SECRET_STRING` in query
+history - a probe secret created with a known canary string stored as
+`SECRET_STRING = '☺☺☺☺☺'`, with the canary absent from
+`QUERY_HISTORY`. The script also skips the temp-file-and-shred dance entirely by going
+through the Python connector, so the key never touches disk.
+
+**Requirement.** `snowflake-connector-python` must be importable by the interpreter you
+invoke. A system `python3` frequently lacks it while a conda or venv python has it;
+check with `python -c "import snowflake.connector"` rather than assuming.
+
+### 5b. What the preflight checks (reference)
+
+All three run against the live registry, inside the command above. `check_ngc_key.py`
+can also be run standalone against an exported `NGC_API_KEY` if you only want to
+validate without creating anything.
 
 | Check | How | Catches |
 |---|---|---|
@@ -171,15 +220,7 @@ Three checks, all against the live registry:
 | Entitled to each enabled NIM | `proxy_auth` pull scope per repo | valid key with no NVAIE entitlement for that model — returns 403 |
 | Configured tag exists | `tags/list` on each repo | a typo or withdrawn version, before the mirror spends four minutes finding out |
 
-Output is one line per check plus an exit code. Passing looks like:
-
-```
-[PASS] key            valid, NGC user 'someone'
-[PASS] genmol         entitled to nim/nvidia/genmol, tag '2.0' exists
-PREFLIGHT PASSED - key is valid and entitled to all 1 enabled NIM(s).
-```
-
-**Stop if it fails.** Two failure notes worth relaying to the user:
+Two failure notes worth relaying to the user:
 
 - An entitlement failure and a wrong repo name are **indistinguishable** — both return
   403. The script says so rather than guessing. Confirm the model at ngc.nvidia.com and
@@ -187,40 +228,21 @@ PREFLIGHT PASSED - key is valid and entitled to all 1 enabled NIM(s).
 - A bad-tag failure prints the tags that do exist, which is usually enough to spot the
   problem immediately.
 
-The script never prints the key and never writes it anywhere.
-
 > Scope limit: this validates the key and the entitlement **from wherever you run it**.
 > It does not prove SPCS can reach NGC — that depends on the external access
 > integration, and a laptop behind a corporate proxy can differ from a compute pool.
 > The deploy itself verifies the egress path.
 
-### 5c. Create the secret
+### 5c. Confirm the secret exists
 
-Only after the preflight passes. Written through a permission-restricted temp file that
-is shredded immediately, so the key never reaches shell history or a command line:
-
-```bash
-umask 077
-SECRET_SQL="$(mktemp)"
-FQ_SECRET=$(python3 -c "import json;c=json.load(open('$CONFIG'));print(f\"{c['target_database']}.{c['target_schema']}.{c['ngc_secret']}\")")
-OWNER=$(python3 -c "import json;print(json.load(open('$CONFIG'))['owner_role'])")
-cat > "$SECRET_SQL" <<SQL
-USE ROLE ${OWNER};
-CREATE SECRET IF NOT EXISTS ${FQ_SECRET}
-  TYPE = GENERIC_STRING
-  SECRET_STRING = '${NGC_API_KEY}'
-  COMMENT = 'NGC API key: source-registry auth for image mirroring, and NIM runtime weight download';
-SQL
-snow sql -f "$SECRET_SQL" -c "$CONN" --enable-templating NONE
-shred -u "$SECRET_SQL" 2>/dev/null || rm -f "$SECRET_SQL"
-unset NGC_API_KEY
-```
-
-Verify without printing it:
+The script prints this itself, but to re-check later without printing the value:
 
 ```bash
 snow sql -c "$CONN" -q "SHOW SECRETS LIKE '%NGC%' IN SCHEMA <db>.<schema>;"
 ```
+
+There is no way to read a secret's value back out via SQL, by design — so if the key is
+ever lost, rotate it with `--replace` rather than trying to recover it.
 
 > This one secret serves two purposes: the build job uses it to authenticate to the
 > source registry, and the running NIM uses it to download weights. If you later

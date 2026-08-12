@@ -126,7 +126,13 @@ def main():
     if not key:
         fail(
             "NGC_API_KEY is not set.\n"
-            "  read -rsp 'NGC API key: ' NGC_API_KEY; echo; export NGC_API_KEY"
+            "  Prefer provision_ngc_secret.py, which prompts safely and creates the\n"
+            "  secret in one step. To set it by hand, note that the hidden-read flag\n"
+            "  is not portable:\n"
+            "    zsh:  read -rs \"?NGC API key: \"; export NGC_API_KEY=\"$REPLY\"\n"
+            "    bash: read -rsp 'NGC API key: ' NGC_API_KEY; export NGC_API_KEY\n"
+            "  Using the bash form under zsh fails with 'no coprocess' and silently\n"
+            "  leaves the variable empty."
         )
     if not key.startswith("nvapi-"):
         fail("NGC_API_KEY does not start with 'nvapi-'. Personal NGC API keys do.", 1)
