@@ -149,12 +149,33 @@ pool has already started.
 
 ### 5a. One command: prompt, validate, create
 
-**You run this, not the assistant.** Use the `!` prefix so it executes in the user's own
-terminal session with a real TTY:
+**Do not run this yourself.** This is the one step in the whole plugin the assistant
+must not execute. Stop, hand the command to the user, and wait for them to report back.
 
-```
-! python3 "$PLUGIN_DIR/assets/preflight/provision_ngc_secret.py" --connection "$CONN"
-```
+Say this to them, explicitly — do not just print the command and assume they know where
+to run it:
+
+> **Run this in your local terminal** (a normal terminal window on your own machine,
+> not through me). It will prompt you for your NGC API key twice, with the input
+> hidden. I never see the key — it goes straight from your keyboard into a Snowflake
+> secret.
+>
+> ```
+> cd <plugin_dir>
+> python3 assets/preflight/provision_ngc_secret.py --connection <conn>
+> ```
+>
+> Paste back the `[PASS]` / `[OK]` lines when it finishes. Those are safe to share —
+> the script never prints the key.
+
+Substitute the real plugin directory and connection name before showing it, so the user
+can copy-paste without editing anything.
+
+The `!` prefix inside this session is **not** a safe substitute, even though it does give
+a real TTY. Verified on 2026-08-12: after a key was typed through `!`, two consecutive
+`getpass` reads from the assistant's own shell each returned that same 70-character key
+from the terminal's replay buffer. A secret typed into `!` is readable by the assistant's
+shell afterwards, which defeats the entire point. **Always a separate terminal window.**
 
 Add `--config <path>` if config.json is not at the plugin root, and `--replace` to
 rotate an existing secret (without it, an existing secret is left untouched and the
@@ -162,10 +183,18 @@ script exits 1, so a re-run is never destructive).
 
 It does three things in order and stops at the first failure:
 
-1. **Prompts twice** for the key with echo off, and requires the two entries to match.
-2. **Preflights** it against the live registry - key validity, per-NIM entitlement, and
+1. **Prints a 4-character confirmation code** and requires the user to type it back.
+   This is the interlock that proves a live human, not double-entry — see below.
+2. **Prompts twice** for the key with echo off, and requires the two entries to match.
+3. **Preflights** it against the live registry - key validity, per-NIM entitlement, and
    tag existence (the table in 5b below).
-3. **Creates the secret** only if every check passed.
+4. **Creates the secret** only if every check passed.
+
+If the user reports the confirmation code never appeared, or that it "did not match" when
+they never got to type it, they ran it somewhere whose input is replayed from a buffer —
+an assistant tool, a CI step, a piped shell. Point them at a real terminal window rather
+than working around the check. The code prompt times out after 90 seconds and fails
+closed rather than hanging.
 
 Expected output, all of which is safe to show anyone:
 
@@ -184,11 +213,19 @@ chat, not on a command line. Anything in a conversation is written to
 any local process via `ps`. The assistant orchestrates around this command and never
 sees the value.
 
-**Why the script prompts twice.** `sys.stdin.isatty()` returns True inside an agent's
-pseudo-terminal, and there getpass does not block - it returns stale bytes from the pty
-buffer. Measured: a getpass call in an agent shell captured 13 characters with no human
-involved. Double entry is the interlock, because buffered junk does not repeat and a
-human typing the key twice does. Verified: run through a tool, the script refuses.
+**Why a confirmation code, and why `isatty` is not enough.** Inside an assistant's
+pseudo-terminal `sys.stdin.isatty()` returns **True** and reads do **not** block — the pty
+replays whatever is already in its buffer, returning the *same* value on every read.
+Measured: two consecutive `getpass` calls in an assistant shell each returned an identical
+70-character key with no human present. So neither `isatty` nor double-entry can
+distinguish a person from a replayed buffer; double-entry passes trivially, because a
+replay matches itself. A nonce generated *after* the process starts cannot be in a buffer
+filled before it started, so echoing it back is real proof of a live human. Verified both
+directions: wrong code refuses and creates nothing; correct code opens the gate.
+
+**Why the key must not be typed into `!`.** Same mechanism, and this is the practical
+consequence: a secret entered through `!` remains in the terminal's replay buffer and can
+be read back by the assistant's shell afterwards. Use a separate terminal window.
 
 **Why not a shell `read`.** The hidden-read flag is not portable. `read -rsp 'p' VAR` is
 bash; under zsh `-p` means *read from coprocess*, so that line fails with

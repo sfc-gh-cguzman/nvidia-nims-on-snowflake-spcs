@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Prompt for an NGC API key, validate it against the registry, create the Snowflake secret.
 
-Run this yourself. Do NOT let an agent run it and do NOT paste a key into a chat, a
-prompt, or a command line:
+RUN THIS IN YOUR LOCAL TERMINAL - a normal terminal window on your own machine. Do not
+let an assistant run it, and do not paste a key into a chat, a prompt, or a command
+line:
 
   - Anything typed to an assistant is persisted to conversation history on disk in
     plaintext, permanently.
@@ -35,8 +36,12 @@ import argparse
 import getpass
 import json
 import os
+import secrets
+import signal
 import sys
 from pathlib import Path
+
+NONCE_TIMEOUT = 90  # seconds to type a 4-character code
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from check_ngc_key import (  # noqa: E402
@@ -63,29 +68,56 @@ def sql_literal(value):
 
 
 def prompt_for_key():
-    """Read the key twice from a no-echo prompt and require the two to match.
+    """Read the key from a no-echo prompt, gated behind a random challenge code.
 
-    Double entry is not about typos. `sys.stdin.isatty()` returns True inside an
-    agent's pseudo-terminal, and in that context getpass does not block - it returns
-    whatever stale bytes are sitting in the pty buffer. Measured: a getpass call in an
-    agent shell captured 13 characters of leftover input with no human involved. So
-    isatty alone cannot distinguish a person from an automation harness.
+    Why a challenge rather than just reading twice: inside an agent's pseudo-terminal
+    `sys.stdin.isatty()` is True AND reads do not block - the pty replays whatever is
+    already in its buffer, returning the SAME value on every read. Measured: two
+    consecutive getpass calls in an agent shell each returned an identical 70-character
+    key with no human present. So neither isatty nor double-entry can distinguish a
+    person from a replayed buffer.
 
-    Requiring the same value twice closes it. Buffered junk does not repeat itself,
-    and a human typing a key twice will match.
+    A nonce generated after this process starts cannot be sitting in a buffer that was
+    filled before it started. Echoing it back is proof of a live human, and a replay
+    fails closed.
     """
     if not sys.stdin.isatty():
         die("stdin is not a TTY, so this cannot prompt.\n"
-            "  Run it yourself in a terminal. Do not run it through an agent.")
-    first = getpass.getpass("NGC API key (nvapi-..., input hidden): ").strip()
-    if not first:
+            "  Run this in your LOCAL TERMINAL - a normal terminal window on your own\n"
+            "  machine. Do not run it through an assistant, a tool, or a CI step.")
+
+    nonce = "".join(secrets.choice("ACDEFGHJKLMNPQRTUVWXY34679") for _ in range(4))
+    print(f"\nConfirmation code: {nonce}")
+
+    # Hard timeout. Without it, a non-interactive shell whose replay buffer has been
+    # drained leaves this blocked on input() forever, which hangs whatever invoked it.
+    # Failing closed after a bounded wait is strictly better than hanging.
+    def _timed_out(signum, frame):
+        raise TimeoutError
+
+    signal.signal(signal.SIGALRM, _timed_out)
+    signal.alarm(NONCE_TIMEOUT)
+    try:
+        answer = input(f"Type the code above to confirm this is a live terminal: ")
+    except (EOFError, TimeoutError):
+        answer = ""
+    finally:
+        signal.alarm(0)
+
+    if answer.strip().upper() != nonce:
+        die("confirmation code did not match, so nothing was created.\n"
+            "  If you never got the chance to type it, this shell is not a real\n"
+            "  interactive terminal - its input is being replayed from a buffer, and a\n"
+            "  secret typed here could be read back by another process.\n"
+            "  Run this in your LOCAL TERMINAL - a normal terminal window on your own\n"
+            "  machine - rather than through an assistant, a tool, or a CI step.", 1)
+
+    key = getpass.getpass("NGC API key (nvapi-..., input hidden): ").strip()
+    if not key:
         die("nothing captured - no secret was created.", 1)
-    second = getpass.getpass("Re-enter the same key to confirm: ").strip()
-    if first != second:
-        die("the two entries did not match, so nothing was created.\n"
-            "  If you did not type twice, this shell cannot prompt safely - run the\n"
-            "  script directly in a terminal rather than through a tool or an agent.", 1)
-    return first
+    if getpass.getpass("Re-enter the same key to confirm: ").strip() != key:
+        die("the two entries did not match, so nothing was created.", 1)
+    return key
 
 
 def main():

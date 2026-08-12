@@ -56,16 +56,28 @@ Pools are created but no service runs on them yet, so nothing is billing.
 
 ## Phase 2: NGC key — free
 
-`/nvidia-nim-on-spcs:setup` Step 5, now a single command that the **user** runs, not the
-assistant:
+`/nvidia-nim-on-spcs:setup` Step 5, a single command. **Do not run it yourself** — this
+is the one step the assistant must not execute.
+
+Tell the user explicitly to **run it in their local terminal** (a normal terminal window
+on their own machine, not through the assistant), substituting the real plugin directory
+and connection name so it is copy-pasteable:
 
 ```
-! python3 "$PLUGIN_DIR/assets/preflight/provision_ngc_secret.py" --connection "$CONN"
+cd <plugin_dir>
+python3 assets/preflight/provision_ngc_secret.py --connection <conn>
 ```
 
-It prompts twice with echo off, preflights the key against the live registry, and only
-then creates the Snowflake secret. **Stop on failure** — an unentitled key otherwise
-fails in Phase 3 with a bare `403 Forbidden` after a compute pool has started.
+The `!` prefix is **not** a safe substitute. Verified: a secret typed through `!` stays in
+the terminal's replay buffer and can be read back by the assistant's own shell afterwards.
+Separate terminal window, always.
+
+It prints a 4-character confirmation code the user must type back (the interlock that
+proves a live human — `isatty` alone is not sufficient), prompts twice for the key with
+echo off, preflights against the live registry, and only then creates the Snowflake
+secret. Ask the user to paste back the `[PASS]`/`[OK]` lines, which are safe to share.
+**Stop on failure** — an unentitled key otherwise fails in Phase 3 with a bare
+`403 Forbidden` after a compute pool has started.
 
 Never route the key through the assistant: chat content is persisted to conversation
 history in plaintext, and argv is readable by any local process via `ps`. The script
