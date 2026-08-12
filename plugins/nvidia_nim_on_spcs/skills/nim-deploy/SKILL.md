@@ -116,8 +116,9 @@ Other signatures: an OOM or a missing GPU profile shows up as the container dyin
 
 ## Step 3: Validate with a real call
 
-Two ways. **Prefer the in-account job** — it needs no credential at all, which makes it
-the reliable option and the only one that works if the caller has no PAT.
+Three ways, in order of preference. **Prefer the in-account job** — it needs no
+credential at all. If you specifically need to prove the *external ingress* path works,
+use the session token in 3b rather than minting a PAT.
 
 ### 3a. From inside the account, no PAT (recommended)
 
@@ -158,7 +159,32 @@ scored molecules is the proof the mirrored image is functional, not merely prese
 
 No external access integration is needed — the traffic never leaves the account.
 
-### 3b. From outside, with a PAT
+### 3b. From outside, no PAT (session token)
+
+The Python Connector can issue a **session token** off a connection that is already
+authenticated in `connections.toml` — whatever the mechanism (local OAuth, SSO, key
+pair). The SPCS ingress accepts it in exactly the same header a PAT uses, so this
+validates the real external path without creating a new credential.
+
+```bash
+python plugins/nvidia_nim_on_spcs/assets/validate/spcs_call.py \
+  --connection "$CONN" --service <db>.<schema>.<service> \
+  --path /generate --json '{"num_molecules": 5, "scoring": "QED"}'
+```
+
+Run it with `--token-only` first. That acquires the token and reports its length
+without calling anything, so you can confirm auth works *before* resuming a GPU pool.
+
+Two constraints worth knowing:
+
+- The connector must be importable by the interpreter you invoke. A system `python3`
+  frequently lacks it while a conda or venv python has it — check with
+  `python -c "import snowflake.connector"` rather than assuming.
+- It calls `conn._rest._token_request('ISSUE')`, a **private** connector API that
+  Snowflake documents with no forward-compatibility guarantee. Fine for validation,
+  not for anything long-lived. Use a PAT for that.
+
+### 3c. From outside, with a PAT
 
 `SHOW ENDPOINTS` returns the ingress URL. Note the random prefix — it changes if the
 service is recreated, so do not hardcode it:

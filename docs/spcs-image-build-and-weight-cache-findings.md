@@ -48,6 +48,13 @@ that would not survive a security review.
 with exit code 0.** Worse than the "readiness probe is failing" opacity in the July
 document, because it looks like success to anything monitoring service status.
 
+**The external ingress endpoint can be validated with no PAT and no key pair.** A
+session token issued off an already-authenticated local connection is accepted by the
+ingress in the same header a PAT uses; genmol returned HTTP 200 with scored molecules
+through the public URL. It relies on a private connector API, so it is a validation
+tool rather than a production pattern, and it exists only because there is no
+first-class way to call a service endpoint as the current session.
+
 ---
 
 ## Part 1: Mirroring a vendor image with no local Docker
@@ -532,6 +539,59 @@ and set `NIM_MAX_MODEL_LEN` below it.
 
 ---
 
+## Part 5: Validating the external ingress endpoint without a PAT
+
+Proving a NIM works is two separate claims: the container serves inference, and the
+public endpoint is reachable with Snowflake auth. The in-account job proves the first
+and deliberately sidesteps the second, because internal service-to-service traffic
+carries no authorization header at all.
+
+Closing the second claim normally means minting a PAT. That was not available here —
+PAT-based auth could not be exercised in this environment, and the secret-injection
+path used to hand a token to a tool returned empty for every consent mode, confirmed
+against a control secret with a known value. Rather than treat external ingress as
+unverifiable, the session-token path closes it.
+
+The Python Connector will issue a session token off a connection that is *already*
+authenticated in `connections.toml`, whatever the underlying mechanism. The SPCS
+ingress accepts that token in the same `Authorization: Snowflake Token="..."` header
+a PAT uses:
+
+```python
+token = conn._rest._token_request("ISSUE")["data"]["sessionToken"]
+requests.post(url, headers={"Authorization": f'Snowflake Token="{token}"'}, data=body)
+```
+
+Verified end to end against genmol: token acquired (353 characters), `POST
+https://<ingress>/generate` returned **HTTP 200** with five QED-scored molecules,
+matching the in-account result. No PAT, no key pair, no new credential of any kind.
+
+Two caveats that belong next to the recommendation:
+
+- `_rest._token_request` is a **private** connector API. Snowflake's own tutorial
+  documents it while stating there is no guarantee it survives a connector upgrade.
+  It is appropriate for validation and wrong for anything durable.
+- The connector must be importable by the interpreter actually invoked. Here the
+  system `python3` did not have it and a conda python did, which presents as a bare
+  `ModuleNotFoundError` that looks like a broken script rather than a wrong
+  interpreter.
+
+The operational lesson is worth more than the trick: **acquire the token before
+resuming the GPU pool.** Token acquisition needs no running service, so a
+`--token-only` check turns "did auth work" into a free question instead of one
+answered at the end of a ~7 minute GPU cold start. The shipped helper
+(`assets/validate/spcs_call.py`) has that flag for exactly this reason.
+
+### Ask
+
+A first-class way to call a service endpoint as the current session — a
+`snow spcs service invoke`, or `SYSTEM$SEND_REQUEST`-style SQL function — would make
+this whole section unnecessary. Today every external caller either manages a
+long-lived credential or reaches into a private connector API, and the second is the
+only option when the first is unavailable.
+
+---
+
 ## Corrections to the 2026-07-31 document
 
 | Earlier claim | Correction |
@@ -561,3 +621,5 @@ templates that encode each finding above at the point where it matters:
   the measurement table that justifies the defaults
 - `assets/templates/40_weight_cache_snapshots.sql.j2` - timestamped snapshots
 - `skills/weight-cache/SKILL.md` - the decision of whether to cache at all
+- `assets/validate/spcs_call.py` - external ingress validation with a session token,
+  `--token-only` to check auth before paying for a GPU cold start
