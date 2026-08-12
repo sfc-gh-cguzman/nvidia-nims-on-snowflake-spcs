@@ -44,12 +44,17 @@ GRANT OWNERSHIP ON SCHEMA {{ db }}.{{ schema }} TO ROLE {{ owner_role }} COPY CU
  ceiling on image size, not memory or vCPU. Check the compressed size of a NIM
  before mirroring it:
    SHOW COMPUTE POOL INSTANCE FAMILIES;
+
+ INITIALLY_SUSPENDED is not optional. Without it CREATE COMPUTE POOL provisions
+ a node immediately and the pool lands in IDLE -- which BILLS, before any service
+ or job exists. AUTO_RESUME brings it back when the mirror job needs it.
 --------------------------------------------------------------------------- */
 CREATE COMPUTE POOL IF NOT EXISTS {{ cfg.build_pool }}
   MIN_NODES = 1
   MAX_NODES = 1
   INSTANCE_FAMILY = {{ cfg.build_pool_family }}
   AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE
   AUTO_SUSPEND_SECS = 600
   COMMENT = 'NVIDIA NIM on SPCS - image build/mirror jobs';
 
@@ -59,6 +64,10 @@ GRANT USAGE, MONITOR ON COMPUTE POOL {{ cfg.build_pool }} TO ROLE {{ owner_role 
  One GPU pool per NIM. Separate pools rather than one shared pool because the
  NIMs have genuinely different GPU requirements, and because suspending one
  model's pool should not stop another's.
+
+ INITIALLY_SUSPENDED = TRUE matters most here: a GPU_NV_S node sitting in IDLE
+ costs the same as one running inference. Measured -- omitting this left a GPU
+ node billing from the moment the pool was created, with no service on it.
 --------------------------------------------------------------------------- */
 {% for nim in nims %}
 -- {{ nim.key }}: {{ nim.image }}:{{ nim.tag }}
@@ -67,6 +76,7 @@ CREATE COMPUTE POOL IF NOT EXISTS {{ nim.gpu_pool }}
   MAX_NODES = 1
   INSTANCE_FAMILY = {{ nim.gpu_pool_family }}
   AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE
   AUTO_SUSPEND_SECS = 900
   COMMENT = 'NVIDIA NIM on SPCS - {{ nim.key }} inference';
 

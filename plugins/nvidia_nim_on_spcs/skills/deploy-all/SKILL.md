@@ -52,7 +52,16 @@ for f in 01_DATABASE_SCHEMA 02_IMAGE_REPOSITORY; do
 done
 ```
 
-Pools are created but no service runs on them yet, so nothing is billing.
+Pools are created `INITIALLY_SUSPENDED`, so nothing is billing. Confirm it rather
+than assuming — a pool that comes up `IDLE` is billing a node with no service on
+it, and only `SUSPENDED` is free:
+
+```bash
+snow sql -c "$CONN" -q "SHOW COMPUTE POOLS LIKE 'NIM%';"
+```
+
+If either pool is not `SUSPENDED`, suspend it now. `AUTO_RESUME = TRUE` brings it
+back when Phase 3 and Phase 4 need it, so this costs nothing later.
 
 ## Phase 2: NGC key — free
 
@@ -94,7 +103,9 @@ bash "$WORKDIR/rendered/build_contexts.sh" "$CONN" "$WORKDIR/contexts"
 snow sql -f "$WORKDIR/rendered/10_MIRROR_JOBS.sql" -c "$CONN" --enable-templating NONE
 ```
 
-~82 seconds for a ~10 GiB image on `GEN_X64_G2_32`. Then verify the digest against
+~82 seconds for the ~10 GiB transfer itself, but budget **~5 minutes for the phase**
+— resuming `NIM_BUILD_POOL` from `SUSPENDED` and provisioning the node dominates.
+Measured 4m51s end to end on `GEN_X64_G2_32`. Then verify the digest against
 upstream (`/nvidia-nim-on-spcs:mirror-image` Step B3) and report the comparison —
 a match proves the mirror is the same image, not a rebuild.
 
