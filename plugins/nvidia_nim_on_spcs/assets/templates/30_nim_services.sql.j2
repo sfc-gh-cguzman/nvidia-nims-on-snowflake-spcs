@@ -1,0 +1,128 @@
+/* ============================================================================
+ 30_NIM_SERVICES  --  role: {{ owner_role }}
+ NVIDIA NIM on SPCS
+
+ One service per enabled NIM, off the image already mirrored into this account.
+ The `image:` value references the EXTERNAL registry hostname
+ ({{ pull_host }}); only the build job uses `registry-local`.
+
+ COST: a service begins consuming its GPU pool the moment it is created. There is
+ no scale-to-zero for an idle NIM. Suspend the pool when you are done:
+   ALTER COMPUTE POOL <pool> SUSPEND;
+
+ COLD START: the container downloads model weights on every cold start --
+ NIM_CACHE_PATH (/opt/nim/.cache) does not exist in the image, so this is always a
+ runtime fetch. That is what the runtime EAI is for, and it is why a large NIM can
+ sit in PENDING for minutes before reporting READY.
+
+ WEIGHT CACHE: set "weight_cache": true on a NIM in config.json to mount a block
+ storage volume at NIM_CACHE_PATH. Weights then survive a suspend/resume, so only
+ the FIRST start downloads them. Verified: block volumes mount root:root but mode
+ 0777, and the NIM runs as uid 1000 (ubuntu), so it can write to the mount without
+ the uid/gid fields (which the spec reference documents for stage volumes only).
+
+ CACHING IS NOT UNCONDITIONALLY FASTER. Measured on genmol 2.0 (~500 MB of
+ weights), container-internal phase from proxy-detect to "ready to receive API
+ requests":
+
+   no cache benefit (first fill), 125 MiB/s   3 downloads   materialize 2.2s   12.2s
+   cache hit on resume,           125 MiB/s   0 downloads   materialize 9.7s   18.2s
+   cache hit, seeded snapshot,    750 MiB/s   0 downloads   materialize 2.3s   10.7s
+
+ The cache removed the download every time, but at the DEFAULT 125 MiB/s volume
+ throughput, reading a small model back off the volume was slower than
+ re-downloading it from the NGC CDN -- a net regression. Raising throughput fixed
+ it. So: always set weight_cache_throughput (750 is the ceiling while iops stays
+ at its 3000 default), and for a NIM with small weights, leave the cache off.
+ genmol ships with weight_cache = false for exactly this reason; llama-3.1-8b
+ (~16 GB) ships with it on, where the 2-3 minute download dominates.
+ MODEL-SPECIFIC ENV: the "env" dict on a NIM in config.json is passed straight
+ through to the container. This is not optional decoration -- some NIMs will not
+ start on a given GPU without it. llama-3.1-8b on a single A10G is the worked
+ example: the A10G has 22.06 GiB usable, 15.0 GiB goes to weights, and vLLM is left
+ with 4.2 GiB for KV cache. The model's default max_model_len of 131072 needs
+ 16.0 GiB, so EngineCore refuses to start and the service reports
+ "DONE / Completed successfully" with exit code 0 after several restarts -- a fatal
+ error that looks like success. Setting NIM_MAX_MODEL_LEN to 16384 fixes it.
+ vLLM prints the ceiling for the observed memory ("estimated maximum model length
+ is 34432"), so the log tells you the value to use.
+============================================================================ */
+
+USE ROLE {{ owner_role }};
+USE WAREHOUSE {{ warehouse }};
+USE SCHEMA {{ db }}.{{ schema }};
+
+{% for nim in nims %}
+/* ---------------------------------------------------------------------------
+ {{ nim.service_name }}  --  {{ nim.key }} on {{ nim.gpu_pool }} ({{ nim.gpu_pool_family }})
+ weights: {{ nim.weight_download_note }}
+ invoke:  POST {{ nim.invoke_path }}
+{% if nim.weight_cache %} cache:   {{ nim.weight_cache_size_gi }}Gi block volume "weights" at {{ nim.weight_cache_path }}{% if nim.weight_cache_from_snapshot %}, seeded from {{ nim.weight_cache_from_snapshot }}{% endif %}
+{% else %} cache:   none - weights re-download on every cold start
+{% endif %}--------------------------------------------------------------------------- */
+-- SPCS does not support REPLACE SERVICE. To change a spec, use
+-- ALTER SERVICE ... FROM SPECIFICATION, or DROP and re-run this file.
+{% if nim.weight_cache %}
+-- A service with a block volume must have MIN_INSTANCES = MAX_INSTANCES, and
+-- neither the instance count nor the volume size can be changed afterwards.
+{% endif %}
+CREATE SERVICE IF NOT EXISTS {{ target(nim.service_name) }}
+  IN COMPUTE POOL {{ nim.gpu_pool }}
+  FROM SPECIFICATION $$
+spec:
+  containers:
+    - name: {{ nim.key }}
+      image: {{ mirrored_image(nim) }}
+      env:
+        NIM_HTTP_API_PORT: "{{ nim.port }}"
+        NIM_LOG_LEVEL: "INFO"
+{% if nim.weight_cache %}        NIM_CACHE_PATH: "{{ nim.weight_cache_path }}"
+{% endif %}{% for k, v in (nim.env | default({})).items() %}        {{ k }}: "{{ v }}"
+{% endfor %}      secrets:
+        - snowflakeSecret: {{ target(cfg.ngc_secret) }}
+          secretKeyRef: SECRET_STRING
+          envVarName: NGC_API_KEY
+{% if nim.weight_cache %}      volumeMounts:
+        - name: weights
+          mountPath: {{ nim.weight_cache_path }}
+{% endif %}      resources:
+        requests:
+          nvidia.com/gpu: {{ nim.gpu_count }}
+          memory: {{ nim.memory_request }}
+        limits:
+          nvidia.com/gpu: {{ nim.gpu_count }}
+          memory: {{ nim.memory_limit }}
+      readinessProbe:
+        port: {{ nim.port }}
+        path: {{ nim.health_path }}
+  endpoints:
+    - name: {{ nim.key | replace('.', '-') }}
+      port: {{ nim.port }}
+      public: {{ 'true' if nim.public_endpoint else 'false' }}
+{% if nim.weight_cache %}  volumes:
+    - name: weights
+      source: block
+      size: {{ nim.weight_cache_size_gi }}Gi
+      blockConfig:
+{% if nim.weight_cache_from_snapshot %}        initialContents:
+          fromSnapshot: {{ nim.weight_cache_from_snapshot }}
+{% endif %}{% if nim.weight_cache_throughput %}        throughput: {{ nim.weight_cache_throughput }}
+{% endif %}        snapshotOnDelete: {{ 'true' if nim.weight_cache_snapshot_on_delete else 'false' }}
+        snapshotDeleteAfter: {{ nim.weight_cache_snapshot_delete_after }}
+{% endif %}  $$
+  EXTERNAL_ACCESS_INTEGRATIONS = ({{ cfg.runtime_eai }})
+  MIN_INSTANCES = 1
+  MAX_INSTANCES = 1
+  COMMENT = 'NVIDIA NIM {{ nim.key }} mirrored from {{ nim.image }}:{{ nim.tag }}';
+
+{% endfor %}
+/* ---------------------------------------------------------------------------
+ Status. PENDING with "Readiness probe is failing" immediately after creation is
+ EXPECTED while weights download. Only treat it as a failure if restartCount is
+ climbing -- that means the container is exiting, and the most common cause is
+ egress to the weight host being blocked.
+--------------------------------------------------------------------------- */
+{% for nim in nims %}
+SELECT '{{ nim.service_name }}' AS service,
+       SYSTEM$GET_SERVICE_STATUS('{{ target(nim.service_name) }}') AS status;
+{% endfor %}

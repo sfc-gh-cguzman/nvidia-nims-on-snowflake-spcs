@@ -1,0 +1,71 @@
+/* ============================================================================
+ 40_WEIGHT_CACHE_SNAPSHOTS  --  role: {{ owner_role }}
+ NVIDIA NIM on SPCS
+
+ Takes a snapshot of each NIM's populated weight cache volume.
+
+ WHEN YOU NEED THIS -- and when you do not:
+
+   You do NOT need a snapshot to survive a suspend/resume. Block volumes are
+   preserved when a service is suspended and resumed, and Snowflake reattaches
+   each volume to the same instance ID. That is the cheap idle state: GPU billing
+   stops, the (much cheaper) volume keeps billing, and the weights are still there
+   on resume. This is what makes suspend-when-idle the sensible default.
+
+   You DO need a snapshot to:
+     - seed a NEW service without re-downloading weights
+       (set weight_cache_from_snapshot on the NIM in config.json)
+     - survive DROP SERVICE, ALTER COMPUTE POOL ... STOP ALL, or a spec change
+       that requires recreating the service (volume size, iops, throughput, and
+       encryption are all immutable after creation)
+
+ Snapshot names are timestamped rather than fixed. CREATE OR REPLACE SNAPSHOT
+ deletes the old snapshot irrecoverably, so a fixed name plus OR REPLACE would
+ quietly destroy the only good copy the moment a re-run caught a half-populated
+ cache. Timestamped names mean a bad snapshot is additive, not destructive.
+
+ Take these only when the cache is fully populated -- the service READY and
+ ideally having served one request. A snapshot of a half-downloaded cache seeds
+ a broken service.
+
+ ACCOUNT LIMIT: 100 snapshots. These accumulate, and a dropped snapshot still
+ bills through its retention period (1 day by default). Prune with DROP SNAPSHOT.
+============================================================================ */
+
+USE ROLE {{ owner_role }};
+USE WAREHOUSE {{ warehouse }};
+USE SCHEMA {{ db }}.{{ schema }};
+
+{% set cached = nims | selectattr('weight_cache') | list %}
+{% if not cached %}
+SELECT 'no NIM in config.json has weight_cache = true - nothing to snapshot' AS status;
+{% else %}
+EXECUTE IMMEDIATE $$
+DECLARE
+    snap_name  STRING;
+    stamp      STRING;
+    log        STRING DEFAULT '';
+BEGIN
+    stamp := TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISS');
+
+{% for nim in cached %}
+    -- {{ nim.key }}: volume name is quoted because volume names are
+    -- case-sensitive and must match the service specification exactly.
+    snap_name := '{{ target((nim.key | replace('-', '_') | replace('.', '_') | upper) ~ "_WEIGHTS_") }}' || stamp;
+    EXECUTE IMMEDIATE 'CREATE SNAPSHOT ' || snap_name
+        || ' FROM SERVICE {{ target(nim.service_name) }}'
+        || ' VOLUME "weights" INSTANCE 0'
+        || ' COMMENT = ''weight cache for {{ nim.image }}:{{ nim.tag }}''';
+    log := log || 'Created snapshot ' || snap_name || '\n';
+
+{% endfor %}
+    RETURN log || '\nSet weight_cache_from_snapshot to one of these in config.json to'
+              || ' seed a new service without re-downloading weights.'
+              || '\nA snapshot must reach CREATED state before it can be used.';
+END;
+$$;
+
+-- Snapshots must be in CREATED state before fromSnapshot will accept them.
+-- A service created against a snapshot that is not yet CREATED fails outright.
+SHOW SNAPSHOTS IN SCHEMA {{ db }}.{{ schema }};
+{% endif %}

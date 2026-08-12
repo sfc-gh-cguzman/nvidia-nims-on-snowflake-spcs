@@ -1,0 +1,133 @@
+-- =============================================================================
+-- NVIDIA NIM on SPCS - Teardown
+--
+-- Removes everything this plugin creates. The fastest way to stop GPU billing
+-- after an evaluation.
+--
+-- DELIBERATELY UNNUMBERED so no deploy loop that globs [0-9]*.sql can reach it.
+-- Run it by hand:
+--
+--   snow sql -f <workdir>/rendered/TEARDOWN.sql -c <connection> \
+--       --role ACCOUNTADMIN --enable-templating NONE
+--
+-- SAFETY: this is a no-op until you set `confirmed` to TRUE in the DECLARE block
+-- below. Nothing is dropped on a stray execution.
+--
+-- Order matters:
+--   1. Stop all services on every pool - a pool with live services cannot be
+--      dropped, and this is also what actually stops the GPU spend
+--   2. Drop both EAIs   - they reference network rules inside the database
+--   3. Drop the database - cascades the image repository (and every mirrored
+--      image), the build stage, the NGC secret, and the network rules
+--   4. Drop the compute pools
+--
+-- HAZARD: teardown drops the pools NAMED IN config.json. If two deployments in
+-- this account share a pool name or an EAI name -- which is common, because GPU
+-- pools are expensive and get reused -- tearing down one takes the other's
+-- compute with it. If that is a risk, run DROP DATABASE on its own instead and
+-- leave the account objects alone.
+--
+-- {{ warehouse }} is NOT dropped by default. Opt in with `drop_warehouse`.
+-- =============================================================================
+
+USE ROLE ACCOUNTADMIN;
+
+EXECUTE IMMEDIATE $$
+DECLARE
+    -- ---------------------------------------------------------------------
+    -- Set this to TRUE to actually tear down. Left FALSE, the script reports
+    -- what it would do and changes nothing.
+    -- ---------------------------------------------------------------------
+    confirmed        BOOLEAN DEFAULT FALSE;
+
+    -- Opt-in extras: off by default because they may be shared.
+    drop_warehouse   BOOLEAN DEFAULT FALSE;
+
+    -- Must match the names in 00_ACCOUNT_SETUP.sql.
+    demo_db          STRING DEFAULT '{{ db }}';
+    demo_wh          STRING DEFAULT '{{ warehouse }}';
+    build_pool       STRING DEFAULT '{{ cfg.build_pool }}';
+    pull_eai         STRING DEFAULT '{{ cfg.registry_pull_eai }}';
+    runtime_eai      STRING DEFAULT '{{ cfg.runtime_eai }}';
+
+    stmt             STRING;
+    log              STRING DEFAULT '';
+
+    -- One GPU pool per NIM, plus the build pool.
+    pool_names ARRAY DEFAULT ARRAY_CONSTRUCT(
+        '{{ cfg.build_pool }}'{% for nim in nims %},
+        '{{ nim.gpu_pool }}'{% endfor %}
+    );
+BEGIN
+    IF (NOT confirmed) THEN
+        RETURN 'ABORTED - nothing was dropped.
+
+This script is inert by design. To tear down, edit TEARDOWN.sql and set:
+
+    confirmed BOOLEAN DEFAULT TRUE;
+
+It would then drop:
+  - every NIM service, the image repository and all mirrored images, the build
+    stage, the NGC secret, and both network rules
+    (all via DROP DATABASE ' || demo_db || ')
+  - external access integrations ' || pull_eai || ' and ' || runtime_eai || '
+  - compute pools ' || ARRAY_TO_STRING(pool_names, ', ') || '
+
+It would NOT drop warehouse ' || demo_wh || ' unless drop_warehouse is also TRUE.
+
+Re-mirroring the images afterwards is a fresh pull from the source registry.';
+    END IF;
+
+    -- 1. Stop services on every pool. This is the step that stops the billing.
+    FOR i IN 0 TO ARRAY_SIZE(pool_names) - 1 DO
+        BEGIN
+            stmt := 'ALTER COMPUTE POOL IF EXISTS '
+                 || GET(pool_names, i)::STRING || ' STOP ALL';
+            EXECUTE IMMEDIATE stmt;
+        EXCEPTION WHEN OTHER THEN NULL;
+        END;
+    END FOR;
+    log := log || 'Services stopped on ' || ARRAY_SIZE(pool_names) || ' pool(s).\n';
+
+    -- 2. Both EAIs first: each holds a reference to a network rule that lives
+    --    inside the database we are about to drop.
+    EXECUTE IMMEDIATE 'DROP EXTERNAL ACCESS INTEGRATION IF EXISTS ' || pull_eai;
+    EXECUTE IMMEDIATE 'DROP EXTERNAL ACCESS INTEGRATION IF EXISTS ' || runtime_eai;
+    log := log || 'Dropped EAIs ' || pull_eai || ' and ' || runtime_eai || '.\n';
+
+    -- 3. The database. Cascades the image repository and every mirrored image.
+    EXECUTE IMMEDIATE 'DROP DATABASE IF EXISTS ' || demo_db;
+    log := log || 'Dropped database ' || demo_db || ' (mirrored images are gone).\n';
+
+    -- 4. Compute pools, now that nothing runs on them.
+    FOR i IN 0 TO ARRAY_SIZE(pool_names) - 1 DO
+        BEGIN
+            stmt := 'DROP COMPUTE POOL IF EXISTS ' || GET(pool_names, i)::STRING;
+            EXECUTE IMMEDIATE stmt;
+        EXCEPTION WHEN OTHER THEN NULL;
+        END;
+    END FOR;
+    log := log || 'Dropped compute pools ' || ARRAY_TO_STRING(pool_names, ', ') || '.\n';
+
+    IF (drop_warehouse) THEN
+        EXECUTE IMMEDIATE 'DROP WAREHOUSE IF EXISTS ' || demo_wh;
+        log := log || 'Dropped warehouse ' || demo_wh || '.\n';
+    ELSE
+        log := log || 'Kept warehouse ' || demo_wh || ' (drop_warehouse = FALSE).\n';
+    END IF;
+
+    RETURN 'TEARDOWN COMPLETE\n\n' || log;
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- Verify. Each of these should come back 0 after a confirmed teardown.
+-- -----------------------------------------------------------------------------
+SHOW DATABASES LIKE '{{ db }}';
+SELECT COUNT(*) AS DATABASES_REMAINING FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+
+SHOW COMPUTE POOLS LIKE '{{ cfg.build_pool }}';
+SELECT COUNT(*) AS BUILD_POOL_REMAINING FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+
+SHOW EXTERNAL ACCESS INTEGRATIONS LIKE '{{ cfg.runtime_eai }}';
+SELECT COUNT(*) AS RUNTIME_EAI_REMAINING FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));

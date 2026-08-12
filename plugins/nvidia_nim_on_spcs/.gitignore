@@ -1,0 +1,9 @@
+# Per-account configuration. Copy assets/config.sample.json to config.json and
+# fill it in. Never commit it -- it names customer databases, roles, and pools.
+config.json
+
+# Rendered SQL and build contexts always go to a scratch dir, never here.
+rendered/
+*.pyc
+__pycache__/
+.DS_Store

@@ -1,0 +1,113 @@
+/* ============================================================================
+ CHECKS  --  role: {{ owner_role }}
+ NVIDIA NIM on SPCS
+
+ One row per invariant: CHECK_NAME | STATUS | DETAIL.
+ PASS and WARN are both acceptable outcomes. WARN means a deliberate trade-off is
+ in place (open runtime egress) or a component simply is not deployed yet.
+ Investigate every FAIL.
+
+ Digest equality against the UPSTREAM registry is not checked here -- it needs an
+ outbound call to {{ cfg.source_registry }}, which SQL cannot make. The
+ mirror-image skill verifies it.
+============================================================================ */
+
+USE ROLE {{ owner_role }};
+USE WAREHOUSE {{ warehouse }};
+USE SCHEMA {{ db }}.{{ schema }};
+
+-- SHOW ... then RESULT_SCAN is the only way to get these into a query. Each
+-- SHOW must be immediately followed by its RESULT_SCAN, so they are captured
+-- into temp tables up front rather than inlined into the checks below.
+SHOW IMAGES IN IMAGE REPOSITORY {{ target(cfg.image_repository) }};
+CREATE OR REPLACE TEMPORARY TABLE _chk_images AS
+SELECT "image_name" AS image_name, "tags" AS tags, "digest" AS digest
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+
+-- Service existence comes from SHOW SERVICES rather than
+-- SYSTEM$GET_SERVICE_STATUS, because that function RAISES on a service that does
+-- not exist instead of returning NULL -- which would abort this whole file when
+-- checks are run before the serve phase.
+SHOW SERVICES IN SCHEMA {{ db }}.{{ schema }};
+CREATE OR REPLACE TEMPORARY TABLE _chk_services AS
+SELECT "name" AS name, "status" AS status, "is_job" AS is_job
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+
+DESCRIBE NETWORK RULE {{ target(cfg.runtime_rule) }};
+CREATE OR REPLACE TEMPORARY TABLE _chk_runtime_rule AS
+SELECT "value_list" AS value_list
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+
+DESCRIBE NETWORK RULE {{ target(cfg.registry_pull_rule) }};
+CREATE OR REPLACE TEMPORARY TABLE _chk_pull_rule AS
+SELECT "value_list" AS value_list
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+
+WITH
+-- Every enabled NIM must have a mirrored image at the expected name and tag.
+image_checks AS (
+{% for nim in nims %}
+  SELECT 'image_mirrored__{{ nim.key }}' AS check_name,
+         IFF(COUNT(*) > 0, 'PASS', 'FAIL') AS status,
+         IFF(COUNT(*) > 0,
+             'digest ' || MAX(digest),
+             'no image named {{ nim.key }}:{{ nim.tag }} in {{ cfg.image_repository }} - run the build phase')
+           AS detail
+  FROM _chk_images
+  WHERE image_name = '{{ nim.key }}' AND tags ILIKE '%{{ nim.tag }}%'
+  {{ "UNION ALL" if not loop.last }}
+{% endfor %}
+),
+-- A service that does not exist yet is a WARN before the serve phase and a FAIL
+-- after it, which this file cannot distinguish -- so it reports WARN and says so.
+-- Container-level readiness is deliberately NOT read here; use
+-- SYSTEM$GET_SERVICE_STATUS for that (see the nim-deploy skill), because service
+-- status lags container status during a cold start.
+service_checks AS (
+{% for nim in nims %}
+  SELECT 'service_running__{{ nim.key }}' AS check_name,
+         CASE
+           WHEN s.status IS NULL THEN 'WARN'
+           WHEN s.status = 'RUNNING' THEN 'PASS'
+           WHEN s.status IN ('PENDING', 'STARTING') THEN 'WARN'
+           ELSE 'FAIL'
+         END AS status,
+         CASE
+           WHEN s.status IS NULL
+             THEN 'service {{ nim.service_name }} does not exist - run the serve phase'
+           WHEN s.status = 'RUNNING'
+             THEN 'RUNNING. Confirm container readiness with SYSTEM$GET_SERVICE_STATUS.'
+           WHEN s.status IN ('PENDING', 'STARTING')
+             THEN s.status || ' - normal during a cold start while weights download;'
+                           || ' if restartCount is climbing the container is exiting, check egress'
+           ELSE s.status
+         END AS detail
+  FROM (SELECT '{{ nim.service_name }}' AS want) w
+  LEFT JOIN _chk_services s
+         ON s.name = w.want AND s.is_job = 'false'
+  {{ "UNION ALL" if not loop.last }}
+{% endfor %}
+),
+-- The runtime egress posture. This is the check most likely to matter in a
+-- security review, so it is surfaced rather than left implicit.
+egress_checks AS (
+  SELECT 'runtime_egress_scoped' AS check_name,
+         IFF(value_list ILIKE '%0.0.0.0%', 'WARN', 'PASS') AS status,
+         IFF(value_list ILIKE '%0.0.0.0%',
+             'UNRESTRICTED outbound from a GPU container: ' || value_list
+               || ' - required today for NIM weight download (CDN redirects are not enumerable),'
+               || ' but narrow runtime_egress_hosts or pre-cache weights before a security review',
+             'scoped to ' || value_list) AS detail
+  FROM _chk_runtime_rule
+  UNION ALL
+  SELECT 'pull_egress_scoped' AS check_name,
+         IFF(value_list ILIKE '%0.0.0.0%', 'WARN', 'PASS') AS status,
+         'image pull allowed to ' || value_list AS detail
+  FROM _chk_pull_rule
+)
+SELECT check_name, status, detail FROM image_checks
+UNION ALL
+SELECT check_name, status, detail FROM service_checks
+UNION ALL
+SELECT check_name, status, detail FROM egress_checks
+ORDER BY IFF(status = 'FAIL', 0, IFF(status = 'WARN', 1, 2)), check_name;

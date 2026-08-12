@@ -1,0 +1,17 @@
+/* ============================================================================
+ 01_DATABASE_SCHEMA  --  role: {{ owner_role }}
+
+ Idempotent. 00_ACCOUNT_SETUP already created these and handed ownership over;
+ this exists so the core phase can be run on its own by whoever owns the
+ database, without ACCOUNTADMIN.
+============================================================================ */
+
+USE ROLE {{ owner_role }};
+USE WAREHOUSE {{ warehouse }};
+
+CREATE DATABASE IF NOT EXISTS {{ db }};
+CREATE SCHEMA IF NOT EXISTS {{ db }}.{{ schema }};
+
+USE SCHEMA {{ db }}.{{ schema }};
+
+SELECT CURRENT_DATABASE() AS database, CURRENT_SCHEMA() AS schema, CURRENT_ROLE() AS role;

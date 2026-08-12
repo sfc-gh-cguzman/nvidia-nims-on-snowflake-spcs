@@ -1,0 +1,27 @@
+/* ============================================================================
+ 02_IMAGE_REPOSITORY  --  role: {{ owner_role }}
+
+ The image repository that mirrored NIM images land in, plus the stage that holds
+ build contexts (a one-line Dockerfile per NIM).
+
+ CREATE IF NOT EXISTS, not OR REPLACE: replacing an image repository would drop
+ every image already mirrored into it, which on a slow link is an expensive
+ mistake to make twice.
+============================================================================ */
+
+USE ROLE {{ owner_role }};
+USE WAREHOUSE {{ warehouse }};
+USE SCHEMA {{ db }}.{{ schema }};
+
+CREATE IMAGE REPOSITORY IF NOT EXISTS {{ target(cfg.image_repository) }}
+  COMMENT = 'Mirrored NVIDIA NIM images';
+
+CREATE STAGE IF NOT EXISTS {{ target(cfg.build_stage) }}
+  DIRECTORY = (ENABLE = TRUE)
+  COMMENT = 'Build contexts for SPCS image builds';
+
+-- The repository_url column here is the EXTERNAL hostname
+-- ({{ pull_host }}). The build job pushes to the in-cluster
+-- hostname instead ({{ push_host }}).
+-- Both are derived by the renderer; neither is hand-written in a template.
+SHOW IMAGE REPOSITORIES LIKE '{{ cfg.image_repository }}' IN SCHEMA {{ db }}.{{ schema }};

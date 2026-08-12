@@ -1,0 +1,111 @@
+version: 1
+# Build manifest for the NVIDIA NIM on SPCS plugin.
+#
+# Rendered by assets/renderer/render.py against a per-account config.json, then
+# executed by the skills in the order below.
+#
+# Keys per object:
+#   object_name  the rendered filename (<object_name>.sql unless out_file is set)
+#   template     the Jinja source in assets/templates/
+#   phase        account | core | build | serve | snapshot | validate | teardown
+#   role         the Snowflake role that must run it
+#   depends_on   ordering (this DAG is linear, so the numbering already encodes it)
+#   enabled_if   optional config flag; when false the object is skipped entirely
+#
+# ORDERING IS ENCODED IN THE FILENAMES, deliberately, matching the dicom and
+# maude plugins. Every object loops over the enabled entries of cfg.nims, so
+# adding a NIM to config.json changes the CONTENTS of these files rather than
+# adding new ones.
+
+objects:
+  # --- phase: account (ACCOUNTADMIN) ---------------------------------------
+  # Compute pools, network rules, and external access integrations cannot be
+  # created by SYSADMIN. This is the one phase a customer may have to hand to a
+  # platform admin. It is also the phase that contains the security decision
+  # worth reviewing (runtime egress), which is a second reason to keep it alone.
+  - object_name: 00_ACCOUNT_SETUP
+    object_type: script
+    template: 00_account_setup.sql.j2
+    phase: account
+    role: ACCOUNTADMIN
+    grain: "warehouse, build pool, one GPU pool per NIM, registry-pull + runtime EAIs, db/schema with ownership handed to owner_role"
+    depends_on: []
+
+  # --- phase: core (owner_role) --------------------------------------------
+  - object_name: 01_DATABASE_SCHEMA
+    object_type: script
+    template: 01_database_schema.sql.j2
+    phase: core
+    role: owner_role
+    grain: "database + schema (idempotent; 00 already created them)"
+    depends_on: [00_ACCOUNT_SETUP]
+
+  - object_name: 02_IMAGE_REPOSITORY
+    object_type: script
+    template: 02_image_repository.sql.j2
+    phase: core
+    role: owner_role
+    grain: "image repository + build-context stage"
+    depends_on: [01_DATABASE_SCHEMA]
+
+  # --- phase: build (owner_role) -------------------------------------------
+  # Everything that gets a vendor image into the account without a local Docker.
+  #
+  # BUILD_CONTEXTS renders to a shell script rather than SQL because it has to
+  # write one Dockerfile per NIM and PUT each to the stage. A Jinja template
+  # produces exactly one output file, and the number of Dockerfiles depends on
+  # how many NIMs are enabled, so the loop has to live inside the artifact.
+  - object_name: BUILD_CONTEXTS
+    object_type: script
+    template: build_contexts_sh.j2
+    out_file: build_contexts.sh
+    phase: build
+    role: owner_role
+    grain: "writes a one-line Dockerfile per NIM and uploads each to the build stage"
+    depends_on: [02_IMAGE_REPOSITORY]
+
+  - object_name: 10_MIRROR_JOBS
+    object_type: script
+    template: 10_mirror_jobs.sql.j2
+    phase: build
+    role: owner_role
+    grain: "one EXECUTE JOB SERVICE per NIM that mirrors nvcr.io -> the account image repository"
+    depends_on: [BUILD_CONTEXTS]
+
+  # --- phase: serve (owner_role) -------------------------------------------
+  - object_name: 30_NIM_SERVICES
+    object_type: script
+    template: 30_nim_services.sql.j2
+    phase: serve
+    role: owner_role
+    grain: "one CREATE SERVICE per NIM off the mirrored image, with readiness probe, endpoint, and an optional block-volume weight cache"
+    depends_on: [10_MIRROR_JOBS]
+
+  # Not part of a deploy path. Run only when a cache is fully populated, which is
+  # a judgement call a script cannot make -- hence its own phase.
+  - object_name: 40_WEIGHT_CACHE_SNAPSHOTS
+    object_type: script
+    template: 40_weight_cache_snapshots.sql.j2
+    phase: snapshot
+    role: owner_role
+    grain: "timestamped snapshot of each populated weight-cache volume, for seeding new services"
+    depends_on: [30_NIM_SERVICES]
+
+  # --- phase: validate ------------------------------------------------------
+  - object_name: CHECKS
+    object_type: script
+    template: checks.sql.j2
+    phase: validate
+    role: owner_role
+    grain: "PASS/FAIL/WARN row per invariant: image present, service READY, endpoint provisioned, egress scope"
+    depends_on: [30_NIM_SERVICES]
+
+  # --- phase: teardown ------------------------------------------------------
+  # Deliberately its own phase so no deploy path can reach it.
+  - object_name: TEARDOWN
+    object_type: script
+    template: teardown.sql.j2
+    phase: teardown
+    role: ACCOUNTADMIN
+    grain: "drops services, db, build pool, every NIM GPU pool, both EAIs and rules. Inert until confirmed = TRUE."
+    depends_on: []

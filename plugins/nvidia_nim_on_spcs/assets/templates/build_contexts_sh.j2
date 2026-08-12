@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# =============================================================================
+# build_contexts.sh  --  rendered artifact, do not edit in place
+# NVIDIA NIM on SPCS
+#
+# Writes one build context per enabled NIM and uploads it to
+# @{{ target(cfg.build_stage) }}/<key>/Dockerfile
+#
+# Each context is a single-line Dockerfile: `FROM <vendor image>`. That is the
+# whole trick. BuildKit resolves the base image, and because there are no
+# further instructions it exports the resolved layers straight through to the
+# destination registry without unpacking a filesystem. The consequence is that
+# the mirrored image keeps the UPSTREAM MANIFEST DIGEST -- it is the same image,
+# not a rebuild of it. (`docker pull` + `docker push` does not preserve the
+# digest, because Docker rewrites the manifest on push.)
+#
+# The platform is deliberately not pinned. SPCS build nodes are linux/amd64, so
+# BuildKit selects the amd64 entry of a multi-arch manifest on its own. Pinning
+# --platform is the classic footgun in the local-Docker workflow: omit it there
+# and you get an arm64 image that fails at RUNTIME on the pool rather than at
+# build time.
+#
+# Usage:  build_contexts.sh <connection-name> <output-dir>
+# =============================================================================
+set -euo pipefail
+
+CONN="${1:?usage: build_contexts.sh <connection-name> <output-dir>}"
+OUTDIR="${2:?usage: build_contexts.sh <connection-name> <output-dir>}"
+
+STAGE="@{{ target(cfg.build_stage) }}"
+
+{% for nim in nims %}
+# --- {{ nim.key }} -----------------------------------------------------------
+mkdir -p "$OUTDIR/{{ nim.key }}"
+cat > "$OUTDIR/{{ nim.key }}/Dockerfile" <<'DOCKERFILE'
+# Mirror {{ nim.image }}:{{ nim.tag }} into a Snowflake image repository
+# with no local Docker. Requires, in the build job:
+#   1. egress to the source registry  ({{ cfg.registry_pull_eai }})
+#   2. source registry credentials in $DOCKER_CONFIG/config.json
+FROM {{ nim.image }}:{{ nim.tag }}
+DOCKERFILE
+
+echo "wrote  $OUTDIR/{{ nim.key }}/Dockerfile"
+snow stage copy "$OUTDIR/{{ nim.key }}/Dockerfile" "$STAGE/{{ nim.key }}/" \
+    -c "$CONN" --overwrite
+{% endfor %}
+
+echo
+echo "build contexts uploaded to $STAGE/"
+snow sql -q "LIST $STAGE;" -c "$CONN"

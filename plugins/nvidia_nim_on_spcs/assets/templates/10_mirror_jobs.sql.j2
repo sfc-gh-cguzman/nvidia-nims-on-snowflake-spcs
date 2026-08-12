@@ -1,0 +1,132 @@
+/* ============================================================================
+ 10_MIRROR_JOBS  --  role: {{ owner_role }}
+ NVIDIA NIM on SPCS
+
+ Mirrors each enabled NIM from {{ cfg.source_registry }} into
+ {{ pull_host }}/{{ repo_path }} with no local Docker.
+
+ ----------------------------------------------------------------------------
+ WHY THIS IS A HAND-ROLLED JOB AND NOT `snow spcs service build-image`
+ ----------------------------------------------------------------------------
+ `snow spcs service build-image` (SnowCLI 3.16+, experimental, behind
+ SNOWFLAKE_CLI_FEATURES_ENABLE_SPCS_BUILD_IMAGE) is the right tool and this job
+ is deliberately a faithful copy of what it does. Use the CLI directly whenever
+ the Dockerfile's base image is PUBLIC -- see the mirror-image skill.
+
+ It cannot mirror a PRIVATE vendor image today. The CLI runs a fixed job service
+ on `/snowflake/images/snowflake_images/sf-image-build:0.0.1`, which is stock
+ moby/buildkit v0.18.2-rootless plus a Go wrapper at /usr/local/bin/image-builder.
+ The wrapper's setupRegistryCredentials writes $HOME/.docker/config.json with
+ exactly one entry -- the destination Snowflake registry, authenticated as
+ `0auth2accesstoken` with the token from /snowflake/session/token. There is no
+ flag and no environment variable for SOURCE registry credentials, so a private
+ base image fails at metadata resolution:
+
+   #2 ERROR: failed to authorize: failed to fetch anonymous token:
+      GET https://nvcr.io/proxy_auth?scope=repository:nim/nvidia/genmol:pull
+      -> 403 Forbidden
+
+ BuildKit resolves registry auth through $DOCKER_CONFIG/config.json, and a job
+ specification CAN set environment variables and mount secrets. So this job runs
+ the same builder binary, with a DOCKER_CONFIG built at container start holding
+ credentials for both registries. The source credential comes from a Snowflake
+ SECRET, so the key never lands in the Dockerfile, on the stage, in this file, or
+ in shell history.
+
+ The command the builder ends up running is:
+
+   buildctl-daemonless.sh build --frontend=dockerfile.v0
+     --local=context=/app --local=dockerfile=/app
+     --output=type=image,name=<dest>,push=true
+
+ DELETE THIS FILE AND USE THE CLI once `build-image` grows a source-registry
+ credential option. Nothing else in the plugin depends on the workaround.
+============================================================================ */
+
+USE ROLE {{ owner_role }};
+USE WAREHOUSE {{ warehouse }};
+USE SCHEMA {{ db }}.{{ schema }};
+
+{% for nim in nims %}
+{% set job = "MIRROR_" ~ (nim.key | replace('-', '_') | replace('.', '_') | upper) %}
+/* ---------------------------------------------------------------------------
+ {{ nim.key }}  <-  {{ nim.image }}:{{ nim.tag }}
+ destination: {{ repo_path }}/{{ nim.key }}:{{ nim.tag }}
+--------------------------------------------------------------------------- */
+
+-- Job services persist as objects, so a re-run would collide on the name.
+DROP SERVICE IF EXISTS {{ target(job) }};
+
+EXECUTE JOB SERVICE
+  IN COMPUTE POOL {{ cfg.build_pool }}
+  NAME = {{ target(job) }}
+  EXTERNAL_ACCESS_INTEGRATIONS = ({{ cfg.registry_pull_eai }})
+  FROM SPECIFICATION $$
+spec:
+  containers:
+    - name: main
+      image: /snowflake/images/snowflake_images/sf-image-build:0.0.1
+      env:
+        IMAGE_REGISTRY_URL: {{ push_host }}/{{ repo_path }}
+        IMAGE_NAME: {{ nim.key }}
+        IMAGE_TAG: "{{ nim.tag }}"
+        BUILD_CONTEXT: /app
+        PUSH_IMAGE: "true"
+        DOCKER_CONFIG: /tmp/dockercfg
+        SOURCE_REGISTRY: {{ cfg.source_registry }}
+        SOURCE_REGISTRY_USER: {{ cfg.source_registry_user }}
+      secrets:
+        - snowflakeSecret: {{ target(cfg.ngc_secret) }}
+          secretKeyRef: SECRET_STRING
+          envVarName: SOURCE_REGISTRY_TOKEN
+      volumeMounts:
+        - name: code-volume
+          mountPath: /app
+      resources:
+        requests:
+          cpu: 8
+          memory: 32Gi
+        limits:
+          cpu: 24
+          memory: 96Gi
+      command:
+        - /bin/sh
+      args:
+        - -c
+        - |
+          set -eu
+
+          # The destination credential the wrapper would normally write to
+          # $HOME/.docker/config.json. Reproduced here because setting
+          # DOCKER_CONFIG makes BuildKit read our file instead of the wrapper's,
+          # so our file has to carry BOTH registries.
+          SF_TOKEN=$(tr -d '\n\r' < /snowflake/session/token)
+          SF_HOST=$(echo "$IMAGE_REGISTRY_URL" | cut -d/ -f1)
+          SF_AUTH=$(printf '%s:%s' '0auth2accesstoken' "$SF_TOKEN" | base64 | tr -d '\n')
+          SRC_AUTH=$(printf '%s:%s' "$SOURCE_REGISTRY_USER" "$SOURCE_REGISTRY_TOKEN" | base64 | tr -d '\n')
+
+          mkdir -p "$DOCKER_CONFIG"
+          umask 077
+          printf '{"auths":{"%s":{"auth":"%s"},"%s":{"auth":"%s"}}}\n' \
+            "$SF_HOST" "$SF_AUTH" "$SOURCE_REGISTRY" "$SRC_AUTH" \
+            > "$DOCKER_CONFIG/config.json"
+
+          echo "registries configured: $SF_HOST, $SOURCE_REGISTRY"
+          unset SOURCE_REGISTRY_TOKEN SRC_AUTH SF_TOKEN SF_AUTH
+
+          exec /usr/local/bin/image-builder
+  volumes:
+    - name: code-volume
+      source: stage
+      stageConfig:
+        name: "@{{ target(cfg.build_stage) }}/{{ nim.key }}"
+      uid: 65532
+  $$;
+
+{% endfor %}
+/* ---------------------------------------------------------------------------
+ What landed. Compare the digest against the upstream manifest to prove the
+ mirror is the same image rather than a rebuild of it -- the mirror-image skill
+ does this automatically.
+--------------------------------------------------------------------------- */
+SHOW IMAGES IN IMAGE REPOSITORY {{ target(cfg.image_repository) }};

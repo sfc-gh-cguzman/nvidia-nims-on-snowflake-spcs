@@ -1,0 +1,24 @@
+{
+  "name": "nvidia-nim-on-spcs",
+  "displayName": "NVIDIA NIM on Snowpark Container Services",
+  "description": "Deploy NVIDIA NIM inference microservices on SPCS with no local Docker. Mirrors NIM images from nvcr.io into a Snowflake image repository inside the account (digest-preserving), then stands up GPU services with readiness probes, scoped egress, and PAT-authenticated endpoints. Config-driven NIM catalog, ships with genmol:2.0 and llama-3.1-8b-instruct validated.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Snowflake HCLS Solutions"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "hcls",
+    "nvidia",
+    "nim",
+    "spcs",
+    "gpu",
+    "inference",
+    "image-builder",
+    "buildkit",
+    "drug-discovery",
+    "genmol",
+    "llm"
+  ],
+  "skills": "./skills"
+}

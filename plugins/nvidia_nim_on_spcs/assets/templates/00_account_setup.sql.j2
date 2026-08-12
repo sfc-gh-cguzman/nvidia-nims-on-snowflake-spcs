@@ -1,0 +1,159 @@
+/* ============================================================================
+ 00_ACCOUNT_SETUP  --  role: ACCOUNTADMIN
+ NVIDIA NIM on SPCS
+
+ Account-level objects that {{ owner_role }} cannot create itself: compute pools,
+ network rules, and external access integrations. Everything here is
+ CREATE ... IF NOT EXISTS so re-running is safe.
+
+ CREATE OR REPLACE is deliberately NOT used on the network rules or the external
+ access integrations. OR REPLACE on a live EAI silently repoints it, which would
+ change the egress posture of any other service already attached to it. To change
+ the host list on an existing deployment, ALTER the rule explicitly.
+============================================================================ */
+
+USE ROLE ACCOUNTADMIN;
+
+/* ---------------------------------------------------------------------------
+ Warehouse. Only used for the SQL the skills run; no inference happens here.
+--------------------------------------------------------------------------- */
+CREATE WAREHOUSE IF NOT EXISTS {{ warehouse }}
+  WAREHOUSE_SIZE = {{ cfg.warehouse_size }}
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE
+  COMMENT = 'NVIDIA NIM on SPCS - control-plane SQL only';
+
+GRANT USAGE ON WAREHOUSE {{ warehouse }} TO ROLE {{ owner_role }};
+
+/* ---------------------------------------------------------------------------
+ Database and schema, with ownership handed to {{ owner_role }} so every later
+ phase can run without ACCOUNTADMIN.
+--------------------------------------------------------------------------- */
+CREATE DATABASE IF NOT EXISTS {{ db }};
+CREATE SCHEMA IF NOT EXISTS {{ db }}.{{ schema }};
+
+GRANT OWNERSHIP ON DATABASE {{ db }} TO ROLE {{ owner_role }} COPY CURRENT GRANTS;
+GRANT OWNERSHIP ON SCHEMA {{ db }}.{{ schema }} TO ROLE {{ owner_role }} COPY CURRENT GRANTS;
+
+/* ---------------------------------------------------------------------------
+ Build pool. CPU only -- mirroring an image needs no GPU. Sized for parallel
+ layer decompression, not for inference.
+
+ Every SPCS instance family caps node storage at 93 GiB, and that is the real
+ ceiling on image size, not memory or vCPU. Check the compressed size of a NIM
+ before mirroring it:
+   SHOW COMPUTE POOL INSTANCE FAMILIES;
+--------------------------------------------------------------------------- */
+CREATE COMPUTE POOL IF NOT EXISTS {{ cfg.build_pool }}
+  MIN_NODES = 1
+  MAX_NODES = 1
+  INSTANCE_FAMILY = {{ cfg.build_pool_family }}
+  AUTO_RESUME = TRUE
+  AUTO_SUSPEND_SECS = 600
+  COMMENT = 'NVIDIA NIM on SPCS - image build/mirror jobs';
+
+GRANT USAGE, MONITOR ON COMPUTE POOL {{ cfg.build_pool }} TO ROLE {{ owner_role }};
+
+/* ---------------------------------------------------------------------------
+ One GPU pool per NIM. Separate pools rather than one shared pool because the
+ NIMs have genuinely different GPU requirements, and because suspending one
+ model's pool should not stop another's.
+--------------------------------------------------------------------------- */
+{% for nim in nims %}
+-- {{ nim.key }}: {{ nim.image }}:{{ nim.tag }}
+CREATE COMPUTE POOL IF NOT EXISTS {{ nim.gpu_pool }}
+  MIN_NODES = 1
+  MAX_NODES = 1
+  INSTANCE_FAMILY = {{ nim.gpu_pool_family }}
+  AUTO_RESUME = TRUE
+  AUTO_SUSPEND_SECS = 900
+  COMMENT = 'NVIDIA NIM on SPCS - {{ nim.key }} inference';
+
+GRANT USAGE, MONITOR ON COMPUTE POOL {{ nim.gpu_pool }} TO ROLE {{ owner_role }};
+{% endfor %}
+
+/* ---------------------------------------------------------------------------
+ Egress, part 1: pulling the image from the source registry.
+
+ This one is tightly scoped and that is not an accident. An image PULL from
+ nvcr.io resolves a fixed set of hosts: the registry, its auth endpoint, the NGC
+ API, and the blob host that registry redirects point at (layers.nvcr.io).
+ Verified by mirroring genmol:2.0 successfully with only these four hosts
+ allowed.
+
+ If a mirror job fails with `dial tcp: lookup <host> ... no such host`, the
+ registry has added a blob host. Add it here rather than widening to 0.0.0.0.
+--------------------------------------------------------------------------- */
+CREATE NETWORK RULE IF NOT EXISTS {{ db }}.{{ schema }}.{{ cfg.registry_pull_rule }}
+  MODE = EGRESS
+  TYPE = HOST_PORT
+  VALUE_LIST = ({% for h in cfg.registry_pull_hosts %}'{{ h }}'{{ ", " if not loop.last }}{% endfor %});
+
+CREATE EXTERNAL ACCESS INTEGRATION IF NOT EXISTS {{ cfg.registry_pull_eai }}
+  ALLOWED_NETWORK_RULES = ({{ db }}.{{ schema }}.{{ cfg.registry_pull_rule }})
+  ENABLED = TRUE
+  COMMENT = 'NVIDIA NIM on SPCS - source registry image pull, scoped';
+
+GRANT USAGE ON INTEGRATION {{ cfg.registry_pull_eai }} TO ROLE {{ owner_role }};
+
+/* ---------------------------------------------------------------------------
+ Egress, part 2: the NIM container at RUNTIME.
+
+ A NIM does not ship its weights. NIM_CACHE_PATH does not exist in the image, so
+ on every cold start the container fetches a file manifest and downloads weights.
+ This rule is what allows that.
+
+ THE HOST LIST BELOW IS SCOPED, AND IT WAS DERIVED EMPIRICALLY. Earlier guidance
+ for this repo said unrestricted 0.0.0.0:443 was required because weight downloads
+ "redirect to unpredictable CDN hosts". That turned out to be wrong. The NGC files
+ API returns download URLs on a single stable host and serves them directly with no
+ onward redirect:
+
+   api.ngc.nvidia.com     the file manifest ("fetching filemap from ...")
+   xfiles.ngc.nvidia.com  every weight blob, HTTP 200, no redirect
+   authn.nvidia.com       token exchange
+
+ The non-obvious part: SOME NIMs ALSO REACH NON-NVIDIA HOSTS. genmol loads its
+ tokenizer from HuggingFace (datamol-io/safe-gpt) at model-init time, which has
+ nothing to do with NGC and is not covered by any NIM weight cache. Hence the
+ huggingface.co and HF CDN entries. llama-3.1-8b does not need them.
+
+ So this list is a UNION across the NIMs in the shipped catalog, and it is not
+ guaranteed complete for a NIM you add yourself. The discovery loop is reliable
+ though, because a blocked host names itself:
+
+   Failed to resolve 'huggingface.co' ([Errno -2] Name or service not known)
+   dial tcp: lookup <host> on 169.254.20.10:53: no such host
+
+ Deploy with this list, read the container log, add whatever host it names, repeat.
+ Do NOT widen to 0.0.0.0 -- nothing observed so far requires it.
+
+ Beware that a blocked host can surface as something that looks unrelated. genmol
+ turned a DNS failure into
+ "TypeError: stat: path should be string, bytes, os.PathLike or integer, not
+ NoneType" several frames deep in a tokenizer library.
+--------------------------------------------------------------------------- */
+CREATE NETWORK RULE IF NOT EXISTS {{ db }}.{{ schema }}.{{ cfg.runtime_rule }}
+  MODE = EGRESS
+  TYPE = HOST_PORT
+  VALUE_LIST = ({% for h in cfg.runtime_egress_hosts %}'{{ h }}'{{ ", " if not loop.last }}{% endfor %});
+
+CREATE EXTERNAL ACCESS INTEGRATION IF NOT EXISTS {{ cfg.runtime_eai }}
+  ALLOWED_NETWORK_RULES = ({{ db }}.{{ schema }}.{{ cfg.runtime_rule }})
+  ENABLED = TRUE
+  COMMENT = 'NVIDIA NIM on SPCS - runtime model weight download';
+
+GRANT USAGE ON INTEGRATION {{ cfg.runtime_eai }} TO ROLE {{ owner_role }};
+
+/* ---------------------------------------------------------------------------
+ Required to create a service that exposes a public endpoint. Without it,
+ CREATE SERVICE fails on the `public: true` endpoint rather than at grant time.
+--------------------------------------------------------------------------- */
+{% if nims | selectattr('public_endpoint') | list %}
+GRANT BIND SERVICE ENDPOINT ON ACCOUNT TO ROLE {{ owner_role }};
+{% endif %}
+
+SELECT 'account setup complete' AS status,
+       '{{ cfg.build_pool }}' AS build_pool,
+       {{ nims | length }} AS nims_enabled;
